@@ -21,18 +21,18 @@ class AppError(Exception):
 def list_employees(conn: sqlite3.Connection, include_deleted: bool = False) -> list[dict]:
     if include_deleted:
         rows = conn.execute(
-            "SELECT id, name, title, deleted FROM employees ORDER BY id"
+            "SELECT id, name, title, deleted, position FROM employees ORDER BY position, id"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, name, title, deleted FROM employees WHERE deleted = 0 ORDER BY id"
+            "SELECT id, name, title, deleted, position FROM employees WHERE deleted = 0 ORDER BY position, id"
         ).fetchall()
     return [_employee_dict(r) for r in rows]
 
 
 def get_employee(conn: sqlite3.Connection, employee_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT id, name, title, deleted FROM employees WHERE id = ?",
+        "SELECT id, name, title, deleted, position FROM employees WHERE id = ?",
         (employee_id,),
     ).fetchone()
     return _employee_dict(row) if row else None
@@ -41,11 +41,14 @@ def get_employee(conn: sqlite3.Connection, employee_id: int) -> dict | None:
 def create_employee(conn: sqlite3.Connection, name: str, title: str | None = None) -> dict:
     cleaned = (name or "").strip()
     if not cleaned:
-        raise AppError("Employee name is required (empty or whitespace-only not allowed)")
+        raise AppError("Укажите имя сотрудника")
     title_cleaned = (title or "").strip() or None
+    if len(cleaned) > 200:
+        raise AppError("Имя сотрудника не должно быть длиннее 200 символов")
+    next_pos = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM employees").fetchone()["p"]
     cur = conn.execute(
-        "INSERT INTO employees (name, title, deleted) VALUES (?, ?, 0)",
-        (cleaned, title_cleaned),
+        "INSERT INTO employees (name, title, deleted, position) VALUES (?, ?, 0, ?)",
+        (cleaned, title_cleaned, next_pos),
     )
     conn.commit()
     return get_employee(conn, cur.lastrowid)  # type: ignore[arg-type]
@@ -58,16 +61,18 @@ def delete_employee(
 ) -> dict:
     emp = get_employee(conn, employee_id)
     if emp is None:
-        raise AppError("Employee not found", 404)
+        raise AppError("Сотрудник не найден", 404)
     if emp["deleted"]:
-        raise AppError("Employee is already deleted")
+        raise AppError("Сотрудник уже удалён")
 
+    # Deleting an employee stops their running timer first, so the tracked
+    # time up to the moment of deletion is kept.
     active = conn.execute(
         "SELECT id FROM time_entries WHERE employee_id = ? AND end_ts IS NULL",
         (employee_id,),
     ).fetchone()
     if active:
-        raise AppError("Cannot delete employee who has an active timer")
+        stop_timer(conn, employee_id)
 
     if with_history:
         conn.execute("DELETE FROM time_entries WHERE employee_id = ?", (employee_id,))
@@ -80,18 +85,65 @@ def delete_employee(
     return {"deleted": True, "mode": "without_history", "id": employee_id, "employee": get_employee(conn, employee_id)}
 
 
+def move_employee(conn: sqlite3.Connection, employee_id: int, to_index: int) -> list[dict]:
+    """Move an active employee to a zero-based index in the overall list order."""
+    emp = get_employee(conn, employee_id)
+    if emp is None or emp["deleted"]:
+        raise AppError("Сотрудник не найден или удалён", 404)
+    ids = [e["id"] for e in list_employees(conn)]
+    ids.remove(employee_id)
+    to_index = max(0, min(int(to_index), len(ids)))
+    ids.insert(to_index, employee_id)
+    conn.executemany(
+        "UPDATE employees SET position = ? WHERE id = ?",
+        [(i + 1, eid) for i, eid in enumerate(ids)],
+    )
+    conn.commit()
+    return list_employees(conn)
+
+
+def employee_board(conn: sqlite3.Connection, page: int = 1, per_page: int = 10) -> dict:
+    """One page of active employees, each with its running timer (if any)."""
+    if per_page not in (10, 20, 50):
+        raise AppError("Размер страницы может быть только 10, 20 или 50")
+    total = conn.execute("SELECT COUNT(*) AS c FROM employees WHERE deleted = 0").fetchone()["c"]
+    pages = max(1, -(-total // per_page))
+    page = max(1, min(int(page), pages))
+    offset = (page - 1) * per_page
+    rows = conn.execute(
+        "SELECT id, name, title, deleted, position FROM employees WHERE deleted = 0 "
+        "ORDER BY position, id LIMIT ? OFFSET ?",
+        (per_page, offset),
+    ).fetchall()
+    active = {t["employee_id"]: t for t in list_active_timers(conn)}
+    items = []
+    for i, r in enumerate(rows):
+        e = _employee_dict(r)
+        e["index"] = offset + i
+        e["active_timer"] = active.get(e["id"])
+        items.append(e)
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
+        "server_time": to_iso(utc_now()),
+    }
+
+
 # ---- timers / entries ----
 
 def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) -> dict:
     emp = get_employee(conn, employee_id)
     if emp is None or emp["deleted"]:
-        raise AppError("Employee not found or deleted", 404)
+        raise AppError("Сотрудник не найден или удалён", 404)
 
     desc = (description or "").strip()
     if not desc:
-        raise AppError("Task description is required")
+        raise AppError("Введите описание задачи")
     if len(desc) > 500:
-        raise AppError("Task description must be at most 500 characters")
+        raise AppError("Описание задачи не должно быть длиннее 500 символов")
 
     start = to_iso(utc_now())
     try:
@@ -103,7 +155,7 @@ def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) ->
         conn.commit()
     except sqlite3.IntegrityError as exc:
         # Unique partial index: one active timer per employee
-        raise AppError("Employee already has an active timer") from exc
+        raise AppError("У сотрудника уже запущен таймер") from exc
 
     return get_entry(conn, cur.lastrowid)  # type: ignore[arg-type]
 
@@ -111,14 +163,14 @@ def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) ->
 def stop_timer(conn: sqlite3.Connection, employee_id: int) -> dict:
     emp = get_employee(conn, employee_id)
     if emp is None:
-        raise AppError("Employee not found", 404)
+        raise AppError("Сотрудник не найден", 404)
 
     row = conn.execute(
         "SELECT id, start_ts FROM time_entries WHERE employee_id = ? AND end_ts IS NULL",
         (employee_id,),
     ).fetchone()
     if row is None:
-        raise AppError("No active timer for this employee")
+        raise AppError("У сотрудника нет запущенного таймера")
 
     end_dt = utc_now()
     start_dt = parse_iso(row["start_ts"])
@@ -172,25 +224,28 @@ def update_entry(
         (entry_id,),
     ).fetchone()
     if row is None:
-        raise AppError("Time entry not found", 404)
+        raise AppError("Запись не найдена", 404)
 
     is_running = row["end_ts"] is None
     new_desc = row["description"] if description is None else description.strip()
     if description is not None:
         if not new_desc:
-            raise AppError("Task description is required")
+            raise AppError("Введите описание задачи")
         if len(new_desc) > 500:
-            raise AppError("Task description must be at most 500 characters")
+            raise AppError("Описание задачи не должно быть длиннее 500 символов")
 
-    new_start_iso = row["start_ts"] if start is None else to_iso(parse_iso(start))
-    new_end_iso = row["end_ts"] if end is None else to_iso(parse_iso(end))
+    try:
+        new_start_iso = row["start_ts"] if start is None else to_iso(parse_iso(start))
+        new_end_iso = row["end_ts"] if end is None else to_iso(parse_iso(end))
+    except ValueError as exc:
+        raise AppError("Неверный формат даты и времени") from exc
 
     if is_running:
         if start is not None:
-            raise AppError("Editing start of a still-running timer is forbidden")
+            raise AppError("Нельзя менять начало у идущего таймера")
         if end is not None:
             # closing via edit is not the intended path; reject to keep stop_timer as the only closer
-            raise AppError("Cannot set end on a running timer via edit; use stop instead")
+            raise AppError("Нельзя задать конец идущему таймеру — остановите его кнопкой «Стоп»")
         conn.execute(
             "UPDATE time_entries SET description = ? WHERE id = ?",
             (new_desc, entry_id),
@@ -200,12 +255,12 @@ def update_entry(
 
     # Closed entry: may edit description, start, end
     if new_end_iso is None:
-        raise AppError("Closed entry must have an end time")
+        raise AppError("У завершённой записи должно быть время окончания")
 
     start_dt = parse_iso(new_start_iso)
     end_dt = parse_iso(new_end_iso)
     if end_dt < start_dt:
-        raise AppError("End must not be before start")
+        raise AppError("Конец не может быть раньше начала")
 
     dur = duration_seconds(start_dt, end_dt)
     conn.execute(
@@ -227,10 +282,10 @@ def report(
         from_dt = parse_iso(period_from)
         to_dt = parse_iso(period_to)
     except ValueError as exc:
-        raise AppError(f"Invalid datetime: {exc}") from exc
+        raise AppError("Неверный формат даты и времени") from exc
 
     if from_dt > to_dt:
-        raise AppError("Invalid period: 'from' must not be after 'to'")
+        raise AppError("Неверный период: дата «С» позже даты «По»")
 
     # Entries that overlap the period (including active ones that started before/during)
     rows = conn.execute(
@@ -302,6 +357,7 @@ def _employee_dict(row: sqlite3.Row) -> dict:
         "name": row["name"],
         "title": row["title"],
         "deleted": bool(row["deleted"]),
+        "position": row["position"],
     }
 
 

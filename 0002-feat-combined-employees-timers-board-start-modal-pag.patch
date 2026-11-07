@@ -1,0 +1,1242 @@
+From 3dae9fd18515de00a5c1224977a6470a2661ba9e Mon Sep 17 00:00:00 2001
+From: Vonckad <vonckad@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:31:58 +0300
+Subject: [PATCH 2/2] feat: combined employees/timers board, start modal,
+ pagination, edit mode, Russian errors
+
+---
+ README.md                |   6 +-
+ app/db.py                |   9 +-
+ app/errors.py            |  78 +++++++++++
+ app/main.py              |  18 +++
+ app/routers/employees.py |  38 ++++-
+ app/routers/timers.py    |   8 +-
+ app/services.py          | 108 +++++++++++----
+ app/static/app.js        | 290 +++++++++++++++++++++++++++++++--------
+ app/static/index.html    | 100 ++++++++------
+ app/static/style.css     |  26 ++++
+ tests/test_core.py       |  84 +++++++++---
+ 11 files changed, 610 insertions(+), 155 deletions(-)
+ create mode 100644 app/errors.py
+
+diff --git a/README.md b/README.md
+index 013d3b0..00bcc29 100644
+--- a/README.md
++++ b/README.md
+@@ -10,6 +10,8 @@
+ - Отчёт за период: записи, пересекающие границы периода, обрезаются по ним.
+ - Данные хранятся в SQLite и переживают перезапуск.
+ 
++Все ошибки API возвращаются одной строкой на русском в поле `detail`.
++
+ ## Стек
+ 
+ Python 3.9+, FastAPI, SQLite, статический UI на HTML/CSS/JS.
+@@ -29,7 +31,9 @@ Python 3.9+, FastAPI, SQLite, статический UI на HTML/CSS/JS.
+ |---|---|---|
+ | GET | `/api/employees` | список сотрудников |
+ | POST | `/api/employees` | добавить сотрудника |
+-| DELETE | `/api/employees/{id}` | удалить сотрудника |
++| GET | `/api/employees/board?page=1&per_page=10` | страница сотрудников с текущими таймерами (10/20/50) |
++| POST | `/api/employees/{id}/move` | переставить сотрудника (`{"to_index": 0}`) |
++| DELETE | `/api/employees/{id}` | удалить сотрудника (идущий таймер останавливается) |
+ | GET | `/api/timers/active` | активные таймеры |
+ | POST | `/api/timers/start` | запустить таймер |
+ | POST | `/api/timers/stop` | остановить таймер |
+diff --git a/app/db.py b/app/db.py
+index 23f8b90..9c303a3 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS employees (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     name TEXT NOT NULL,
+     title TEXT,
+-    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))
++    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
++    position INTEGER NOT NULL DEFAULT 0
+ );
+ 
+ CREATE TABLE IF NOT EXISTS time_entries (
+@@ -56,6 +57,11 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+ 
+ def init_db(conn: sqlite3.Connection, seed: bool = True) -> None:
+     conn.executescript(_SCHEMA)
++    cols = {r["name"] for r in conn.execute("PRAGMA table_info(employees)").fetchall()}
++    if "position" not in cols:
++        # Migration for databases created before manual ordering existed.
++        conn.execute("ALTER TABLE employees ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
++        conn.execute("UPDATE employees SET position = id")
+     if seed:
+         row = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()
+         if row["c"] == 0:
+@@ -63,6 +69,7 @@ def init_db(conn: sqlite3.Connection, seed: bool = True) -> None:
+                 "INSERT INTO employees (name, title) VALUES (?, ?)",
+                 _SEED,
+             )
++            conn.execute("UPDATE employees SET position = id")
+     conn.commit()
+ 
+ 
+diff --git a/app/errors.py b/app/errors.py
+new file mode 100644
+index 0000000..15e32c9
+--- /dev/null
++++ b/app/errors.py
+@@ -0,0 +1,78 @@
++"""Human-readable Russian error messages for the API."""
++
++from __future__ import annotations
++
++from typing import Any, Iterable
++
++FIELD_NAMES = {
++    "name": "Имя",
++    "title": "Должность",
++    "description": "Описание задачи",
++    "employee_id": "Сотрудник",
++    "start": "Начало",
++    "end": "Конец",
++    "from": "Дата «С»",
++    "to": "Дата «По»",
++    "page": "Страница",
++    "per_page": "Размер страницы",
++    "to_index": "Позиция",
++    "with_history": "Режим удаления",
++    "include_deleted": "Показывать удалённых",
++}
++
++HTTP_DEFAULTS = {
++    400: "Некорректный запрос",
++    404: "Не найдено",
++    405: "Метод не поддерживается",
++    422: "Проверьте введённые данные",
++    500: "Внутренняя ошибка сервера",
++}
++
++
++def _field(loc: Iterable[Any]) -> str:
++    parts = [str(p) for p in loc if p not in ("body", "query", "path")]
++    if not parts:
++        return "Данные запроса"
++    return FIELD_NAMES.get(parts[-1], parts[-1])
++
++
++def _one(err: dict) -> str:
++    kind = err.get("type", "")
++    ctx = err.get("ctx") or {}
++    field = _field(err.get("loc", ()))
++    if kind == "missing":
++        return f"Поле «{field}» обязательно"
++    if kind == "string_too_short":
++        if ctx.get("min_length", 1) <= 1:
++            return f"Поле «{field}» не может быть пустым"
++        return f"Поле «{field}»: минимум {ctx['min_length']} символов"
++    if kind == "string_too_long":
++        return f"Поле «{field}»: максимум {ctx.get('max_length')} символов"
++    if kind.startswith("int") or kind.startswith("float"):
++        return f"Поле «{field}» должно быть числом"
++    if kind.startswith("bool"):
++        return f"Поле «{field}» должно быть да/нет"
++    if kind.startswith("string"):
++        return f"Поле «{field}» должно быть текстом"
++    if kind in ("greater_than_equal", "greater_than"):
++        return f"Поле «{field}» должно быть не меньше {ctx.get('ge', ctx.get('gt'))}"
++    if kind in ("less_than_equal", "less_than"):
++        return f"Поле «{field}» должно быть не больше {ctx.get('le', ctx.get('lt'))}"
++    if kind in ("json_invalid", "model_attributes_type", "dict_type"):
++        return "Некорректный формат запроса"
++    return f"Некорректное значение поля «{field}»"
++
++
++def validation_message(errors: list[dict]) -> str:
++    seen: list[str] = []
++    for err in errors:
++        msg = _one(err)
++        if msg not in seen:
++            seen.append(msg)
++    return "; ".join(seen) or HTTP_DEFAULTS[422]
++
++
++def http_message(status: int, detail: Any) -> str:
++    if isinstance(detail, str) and detail and not detail.isascii():
++        return detail  # already a Russian message from the app
++    return HTTP_DEFAULTS.get(status, "Ошибка запроса")
+diff --git a/app/main.py b/app/main.py
+index 804474f..f268c5f 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
+ from pathlib import Path
+ 
+ from fastapi import FastAPI, Request
++from fastapi.exceptions import RequestValidationError
++from starlette.exceptions import HTTPException as StarletteHTTPException
+ from fastapi.responses import FileResponse, JSONResponse, Response
+ from fastapi.staticfiles import StaticFiles
+ 
+@@ -13,6 +15,7 @@ from app.db import init_db
+ from app.deps import get_db, set_db_path
+ from app.routers import employees, reports, timers
+ from app.services import AppError
++from app.errors import validation_message, http_message
+ 
+ STATIC_DIR = Path(__file__).resolve().parent / "static"
+ 
+@@ -35,6 +38,21 @@ async def app_error_handler(_request: Request, exc: AppError):
+     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+ 
+ 
++@app.exception_handler(RequestValidationError)
++async def validation_error_handler(_request: Request, exc: RequestValidationError):
++    # Never leak raw pydantic error lists to the UI: one readable Russian message.
++    return JSONResponse(status_code=422, content={"detail": validation_message(exc.errors())})
++
++
++@app.exception_handler(StarletteHTTPException)
++async def http_error_handler(_request: Request, exc: StarletteHTTPException):
++    return JSONResponse(
++        status_code=exc.status_code,
++        content={"detail": http_message(exc.status_code, exc.detail)},
++        headers=getattr(exc, "headers", None),
++    )
++
++
+ app.include_router(employees.router)
+ app.include_router(timers.router)
+ app.include_router(reports.router)
+diff --git a/app/routers/employees.py b/app/routers/employees.py
+index b9263c2..c159720 100644
+--- a/app/routers/employees.py
++++ b/app/routers/employees.py
+@@ -7,14 +7,18 @@ from pydantic import BaseModel, Field
+ import sqlite3
+ 
+ from app.deps import get_db
+-from app.services import AppError, create_employee, delete_employee, list_employees
++from app.services import AppError, create_employee, delete_employee, employee_board, list_employees, move_employee
+ 
+ router = APIRouter(prefix="/api/employees", tags=["employees"])
+ 
+ 
+ class EmployeeCreate(BaseModel):
+-    name: str = Field(..., min_length=1)
+-    title: Optional[str] = None
++    name: str = ""
++    title: Optional[str] = Field(None, max_length=200)
++
++
++class EmployeeMove(BaseModel):
++    to_index: int = Field(..., ge=0)
+ 
+ 
+ @router.get("")
+@@ -28,6 +32,34 @@ def api_list_employees(
+         conn.close()
+ 
+ 
++@router.get("/board")
++def api_employee_board(
++    page: int = Query(1, ge=1),
++    per_page: int = Query(10),
++    conn: sqlite3.Connection = Depends(get_db),
++):
++    try:
++        return employee_board(conn, page=page, per_page=per_page)
++    except AppError as e:
++        from fastapi import HTTPException
++
++        raise HTTPException(status_code=e.status_code, detail=e.message) from e
++    finally:
++        conn.close()
++
++
++@router.post("/{employee_id}/move")
++def api_move_employee(employee_id: int, body: EmployeeMove, conn: sqlite3.Connection = Depends(get_db)):
++    try:
++        return move_employee(conn, employee_id, body.to_index)
++    except AppError as e:
++        from fastapi import HTTPException
++
++        raise HTTPException(status_code=e.status_code, detail=e.message) from e
++    finally:
++        conn.close()
++
++
+ @router.post("", status_code=201)
+ def api_create_employee(body: EmployeeCreate, conn: sqlite3.Connection = Depends(get_db)):
+     try:
+diff --git a/app/routers/timers.py b/app/routers/timers.py
+index 3ac765b..3412c30 100644
+--- a/app/routers/timers.py
++++ b/app/routers/timers.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ from typing import Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel
+ import sqlite3
+ 
+ from app.deps import get_db
+@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["timers"])
+ 
+ class StartBody(BaseModel):
+     employee_id: int
+-    description: str = Field(..., min_length=1, max_length=500)
++    description: str = ""
+ 
+ 
+ class StopBody(BaseModel):
+@@ -29,7 +29,7 @@ class StopBody(BaseModel):
+ 
+ 
+ class EditBody(BaseModel):
+-    description: Optional[str] = Field(None, max_length=500)
++    description: Optional[str] = None
+     start: Optional[str] = None
+     end: Optional[str] = None
+ 
+@@ -67,7 +67,7 @@ def api_get_entry(entry_id: int, conn: sqlite3.Connection = Depends(get_db)):
+     try:
+         entry = get_entry(conn, entry_id)
+         if entry is None:
+-            raise HTTPException(status_code=404, detail="Time entry not found")
++            raise HTTPException(status_code=404, detail="Запись не найдена")
+         return entry
+     finally:
+         conn.close()
+diff --git a/app/services.py b/app/services.py
+index c8b188c..b32f8fd 100644
+--- a/app/services.py
++++ b/app/services.py
+@@ -21,18 +21,18 @@ class AppError(Exception):
+ def list_employees(conn: sqlite3.Connection, include_deleted: bool = False) -> list[dict]:
+     if include_deleted:
+         rows = conn.execute(
+-            "SELECT id, name, title, deleted FROM employees ORDER BY id"
++            "SELECT id, name, title, deleted, position FROM employees ORDER BY position, id"
+         ).fetchall()
+     else:
+         rows = conn.execute(
+-            "SELECT id, name, title, deleted FROM employees WHERE deleted = 0 ORDER BY id"
++            "SELECT id, name, title, deleted, position FROM employees WHERE deleted = 0 ORDER BY position, id"
+         ).fetchall()
+     return [_employee_dict(r) for r in rows]
+ 
+ 
+ def get_employee(conn: sqlite3.Connection, employee_id: int) -> dict | None:
+     row = conn.execute(
+-        "SELECT id, name, title, deleted FROM employees WHERE id = ?",
++        "SELECT id, name, title, deleted, position FROM employees WHERE id = ?",
+         (employee_id,),
+     ).fetchone()
+     return _employee_dict(row) if row else None
+@@ -41,11 +41,14 @@ def get_employee(conn: sqlite3.Connection, employee_id: int) -> dict | None:
+ def create_employee(conn: sqlite3.Connection, name: str, title: str | None = None) -> dict:
+     cleaned = (name or "").strip()
+     if not cleaned:
+-        raise AppError("Employee name is required (empty or whitespace-only not allowed)")
++        raise AppError("Укажите имя сотрудника")
+     title_cleaned = (title or "").strip() or None
++    if len(cleaned) > 200:
++        raise AppError("Имя сотрудника не должно быть длиннее 200 символов")
++    next_pos = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM employees").fetchone()["p"]
+     cur = conn.execute(
+-        "INSERT INTO employees (name, title, deleted) VALUES (?, ?, 0)",
+-        (cleaned, title_cleaned),
++        "INSERT INTO employees (name, title, deleted, position) VALUES (?, ?, 0, ?)",
++        (cleaned, title_cleaned, next_pos),
+     )
+     conn.commit()
+     return get_employee(conn, cur.lastrowid)  # type: ignore[arg-type]
+@@ -58,16 +61,18 @@ def delete_employee(
+ ) -> dict:
+     emp = get_employee(conn, employee_id)
+     if emp is None:
+-        raise AppError("Employee not found", 404)
++        raise AppError("Сотрудник не найден", 404)
+     if emp["deleted"]:
+-        raise AppError("Employee is already deleted")
++        raise AppError("Сотрудник уже удалён")
+ 
++    # Deleting an employee stops their running timer first, so the tracked
++    # time up to the moment of deletion is kept.
+     active = conn.execute(
+         "SELECT id FROM time_entries WHERE employee_id = ? AND end_ts IS NULL",
+         (employee_id,),
+     ).fetchone()
+     if active:
+-        raise AppError("Cannot delete employee who has an active timer")
++        stop_timer(conn, employee_id)
+ 
+     if with_history:
+         conn.execute("DELETE FROM time_entries WHERE employee_id = ?", (employee_id,))
+@@ -80,18 +85,65 @@ def delete_employee(
+     return {"deleted": True, "mode": "without_history", "id": employee_id, "employee": get_employee(conn, employee_id)}
+ 
+ 
++def move_employee(conn: sqlite3.Connection, employee_id: int, to_index: int) -> list[dict]:
++    """Move an active employee to a zero-based index in the overall list order."""
++    emp = get_employee(conn, employee_id)
++    if emp is None or emp["deleted"]:
++        raise AppError("Сотрудник не найден или удалён", 404)
++    ids = [e["id"] for e in list_employees(conn)]
++    ids.remove(employee_id)
++    to_index = max(0, min(int(to_index), len(ids)))
++    ids.insert(to_index, employee_id)
++    conn.executemany(
++        "UPDATE employees SET position = ? WHERE id = ?",
++        [(i + 1, eid) for i, eid in enumerate(ids)],
++    )
++    conn.commit()
++    return list_employees(conn)
++
++
++def employee_board(conn: sqlite3.Connection, page: int = 1, per_page: int = 10) -> dict:
++    """One page of active employees, each with its running timer (if any)."""
++    if per_page not in (10, 20, 50):
++        raise AppError("Размер страницы может быть только 10, 20 или 50")
++    total = conn.execute("SELECT COUNT(*) AS c FROM employees WHERE deleted = 0").fetchone()["c"]
++    pages = max(1, -(-total // per_page))
++    page = max(1, min(int(page), pages))
++    offset = (page - 1) * per_page
++    rows = conn.execute(
++        "SELECT id, name, title, deleted, position FROM employees WHERE deleted = 0 "
++        "ORDER BY position, id LIMIT ? OFFSET ?",
++        (per_page, offset),
++    ).fetchall()
++    active = {t["employee_id"]: t for t in list_active_timers(conn)}
++    items = []
++    for i, r in enumerate(rows):
++        e = _employee_dict(r)
++        e["index"] = offset + i
++        e["active_timer"] = active.get(e["id"])
++        items.append(e)
++    return {
++        "items": items,
++        "total": total,
++        "page": page,
++        "per_page": per_page,
++        "pages": pages,
++        "server_time": to_iso(utc_now()),
++    }
++
++
+ # ---- timers / entries ----
+ 
+ def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) -> dict:
+     emp = get_employee(conn, employee_id)
+     if emp is None or emp["deleted"]:
+-        raise AppError("Employee not found or deleted", 404)
++        raise AppError("Сотрудник не найден или удалён", 404)
+ 
+     desc = (description or "").strip()
+     if not desc:
+-        raise AppError("Task description is required")
++        raise AppError("Введите описание задачи")
+     if len(desc) > 500:
+-        raise AppError("Task description must be at most 500 characters")
++        raise AppError("Описание задачи не должно быть длиннее 500 символов")
+ 
+     start = to_iso(utc_now())
+     try:
+@@ -103,7 +155,7 @@ def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) ->
+         conn.commit()
+     except sqlite3.IntegrityError as exc:
+         # Unique partial index: one active timer per employee
+-        raise AppError("Employee already has an active timer") from exc
++        raise AppError("У сотрудника уже запущен таймер") from exc
+ 
+     return get_entry(conn, cur.lastrowid)  # type: ignore[arg-type]
+ 
+@@ -111,14 +163,14 @@ def start_timer(conn: sqlite3.Connection, employee_id: int, description: str) ->
+ def stop_timer(conn: sqlite3.Connection, employee_id: int) -> dict:
+     emp = get_employee(conn, employee_id)
+     if emp is None:
+-        raise AppError("Employee not found", 404)
++        raise AppError("Сотрудник не найден", 404)
+ 
+     row = conn.execute(
+         "SELECT id, start_ts FROM time_entries WHERE employee_id = ? AND end_ts IS NULL",
+         (employee_id,),
+     ).fetchone()
+     if row is None:
+-        raise AppError("No active timer for this employee")
++        raise AppError("У сотрудника нет запущенного таймера")
+ 
+     end_dt = utc_now()
+     start_dt = parse_iso(row["start_ts"])
+@@ -172,25 +224,28 @@ def update_entry(
+         (entry_id,),
+     ).fetchone()
+     if row is None:
+-        raise AppError("Time entry not found", 404)
++        raise AppError("Запись не найдена", 404)
+ 
+     is_running = row["end_ts"] is None
+     new_desc = row["description"] if description is None else description.strip()
+     if description is not None:
+         if not new_desc:
+-            raise AppError("Task description is required")
++            raise AppError("Введите описание задачи")
+         if len(new_desc) > 500:
+-            raise AppError("Task description must be at most 500 characters")
++            raise AppError("Описание задачи не должно быть длиннее 500 символов")
+ 
+-    new_start_iso = row["start_ts"] if start is None else to_iso(parse_iso(start))
+-    new_end_iso = row["end_ts"] if end is None else to_iso(parse_iso(end))
++    try:
++        new_start_iso = row["start_ts"] if start is None else to_iso(parse_iso(start))
++        new_end_iso = row["end_ts"] if end is None else to_iso(parse_iso(end))
++    except ValueError as exc:
++        raise AppError("Неверный формат даты и времени") from exc
+ 
+     if is_running:
+         if start is not None:
+-            raise AppError("Editing start of a still-running timer is forbidden")
++            raise AppError("Нельзя менять начало у идущего таймера")
+         if end is not None:
+             # closing via edit is not the intended path; reject to keep stop_timer as the only closer
+-            raise AppError("Cannot set end on a running timer via edit; use stop instead")
++            raise AppError("Нельзя задать конец идущему таймеру — остановите его кнопкой «Стоп»")
+         conn.execute(
+             "UPDATE time_entries SET description = ? WHERE id = ?",
+             (new_desc, entry_id),
+@@ -200,12 +255,12 @@ def update_entry(
+ 
+     # Closed entry: may edit description, start, end
+     if new_end_iso is None:
+-        raise AppError("Closed entry must have an end time")
++        raise AppError("У завершённой записи должно быть время окончания")
+ 
+     start_dt = parse_iso(new_start_iso)
+     end_dt = parse_iso(new_end_iso)
+     if end_dt < start_dt:
+-        raise AppError("End must not be before start")
++        raise AppError("Конец не может быть раньше начала")
+ 
+     dur = duration_seconds(start_dt, end_dt)
+     conn.execute(
+@@ -227,10 +282,10 @@ def report(
+         from_dt = parse_iso(period_from)
+         to_dt = parse_iso(period_to)
+     except ValueError as exc:
+-        raise AppError(f"Invalid datetime: {exc}") from exc
++        raise AppError("Неверный формат даты и времени") from exc
+ 
+     if from_dt > to_dt:
+-        raise AppError("Invalid period: 'from' must not be after 'to'")
++        raise AppError("Неверный период: дата «С» позже даты «По»")
+ 
+     # Entries that overlap the period (including active ones that started before/during)
+     rows = conn.execute(
+@@ -302,6 +357,7 @@ def _employee_dict(row: sqlite3.Row) -> dict:
+         "name": row["name"],
+         "title": row["title"],
+         "deleted": bool(row["deleted"]),
++        "position": row["position"],
+     }
+ 
+ 
+diff --git a/app/static/app.js b/app/static/app.js
+index 00597d9..ce77dd3 100644
+--- a/app/static/app.js
++++ b/app/static/app.js
+@@ -8,16 +8,21 @@ function setMsg(el, text, ok) {
+ }
+ 
+ async function api(path, opts = {}) {
+-  const res = await fetch(path, {
+-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+-    ...opts,
+-  });
++  let res;
++  try {
++    res = await fetch(path, {
++      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
++      ...opts,
++    });
++  } catch {
++    throw new Error("Нет связи с сервером. Проверьте, что приложение запущено.");
++  }
+   let data = null;
+   const text = await res.text();
+   try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text }; }
+   if (!res.ok) {
+-    const detail = data && data.detail != null ? data.detail : res.statusText;
+-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
++    const detail = data && data.detail != null ? data.detail : null;
++    throw new Error(typeof detail === "string" && detail ? detail : "Ошибка сервера (" + res.status + "). Попробуйте ещё раз.");
+   }
+   return data;
+ }
+@@ -63,36 +68,176 @@ function nameColorMap(employees) {
+ }
+ 
+ let employeesCache = [];
++const board = { page: 1, perPage: Number(localStorage.getItem("tt.perPage")) || 10, pages: 1, total: 0, editMode: false, clockSkew: 0 };
++
++function fmtDuration(sec) {
++  sec = Math.max(0, Math.floor(sec));
++  const h = Math.floor(sec / 3600);
++  const m = Math.floor((sec % 3600) / 60);
++  const s = sec % 60;
++  const pad = (n) => String(n).padStart(2, "0");
++  return `${pad(h)}:${pad(m)}:${pad(s)}`;
++}
++
++function elapsedSince(iso) {
++  return (Date.now() + board.clockSkew - new Date(iso).getTime()) / 1000;
++}
+ 
+ async function loadEmployees() {
+-  employeesCache = await api("/api/employees");
++  const q = new URLSearchParams({ page: board.page, per_page: board.perPage });
++  const data = await api(`/api/employees/board?${q}`);
++  board.clockSkew = new Date(data.server_time).getTime() - Date.now();
++  board.page = data.page;
++  board.pages = data.pages;
++  board.total = data.total;
++  employeesCache = data.items;
++  renderBoard();
++}
++
++function renderBoard() {
+   const colors = nameColorMap(employeesCache);
+   const tbody = $("emp-table");
+   tbody.innerHTML = "";
+-  const sel = $("timer-emp");
+-  const prev = sel.value;
+-  sel.innerHTML = "";
++  const edit = board.editMode;
+ 
+-  for (const e of employeesCache) {
++  employeesCache.forEach((e, i) => {
++    const t = e.active_timer;
+     const tr = document.createElement("tr");
++    tr.dataset.id = e.id;
++    tr.dataset.index = e.index;
+     if (colors[e.id] != null) tr.className = `emp-color-${colors[e.id]}`;
++    const timeCell = t
++      ? `<span class="timer running" data-start="${escapeHtml(t.start)}">${fmtDuration(elapsedSince(t.start))}</span>`
++      : `<span class="timer">00:00:00</span>`;
++    const isFirst = e.index === 0;
++    const isLast = e.index === board.total - 1;
++    const actions = edit
++      ? `<button type="button" class="secondary icon-btn" data-up="${e.id}" ${isFirst ? "disabled" : ""} title="Выше">↑</button>
++         <button type="button" class="secondary icon-btn" data-down="${e.id}" ${isLast ? "disabled" : ""} title="Ниже">↓</button>
++         <button type="button" class="danger" data-del="${e.id}">Удалить</button>`
++      : t
++        ? `<button type="button" class="secondary" data-stop="${e.id}">Стоп</button>`
++        : `<button type="button" data-start="${e.id}">Старт</button>`;
+     tr.innerHTML = `
+-      <td>${escapeHtml(e.name)}</td>
+-      <td>${escapeHtml(e.title || "—")}</td>
+-      <td class="actions">
+-        <button type="button" class="danger" data-del="${e.id}">Удалить</button>
+-      </td>`;
++      <td class="col-handle">${edit ? '<span class="handle" title="Перетащить">⠿</span>' : ""}</td>
++      <td>${escapeHtml(e.name)}<span class="emp-title">${escapeHtml(e.title || "")}</span></td>
++      <td class="task" title="${t ? escapeHtml(t.description) : ""}">${t ? escapeHtml(t.description) : "—"}</td>
++      <td>${timeCell}</td>
++      <td class="actions">${actions}</td>`;
++    if (edit) setupDrag(tr);
+     tbody.appendChild(tr);
++  });
+ 
+-    const opt = document.createElement("option");
+-    opt.value = e.id;
+-    opt.textContent = e.title ? `${e.name} — ${e.title}` : e.name;
+-    sel.appendChild(opt);
++  if (!employeesCache.length) {
++    tbody.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">Сотрудников пока нет — добавьте первого</td></tr>`;
+   }
+-  if (prev) sel.value = prev;
+ 
+-  tbody.querySelectorAll("[data-del]").forEach((btn) => {
+-    btn.addEventListener("click", () => openDeleteModal(Number(btn.dataset.del)));
++  tbody.querySelectorAll("[data-start]").forEach((btn) => {
++    if (btn.tagName === "BUTTON") btn.addEventListener("click", () => openStartModal(Number(btn.dataset.start)));
++  });
++  tbody.querySelectorAll("[data-stop]").forEach((btn) => btn.addEventListener("click", () => stopTimer(Number(btn.dataset.stop))));
++  tbody.querySelectorAll("[data-del]").forEach((btn) => btn.addEventListener("click", () => openDeleteModal(Number(btn.dataset.del))));
++  tbody.querySelectorAll("[data-up]").forEach((btn) => btn.addEventListener("click", () => moveEmployee(Number(btn.dataset.up), -1)));
++  tbody.querySelectorAll("[data-down]").forEach((btn) => btn.addEventListener("click", () => moveEmployee(Number(btn.dataset.down), 1)));
++
++  renderPager();
++}
++
++function renderPager() {
++  $("per-page").value = String(board.perPage);
++  $("pg-prev").disabled = board.page <= 1;
++  $("pg-next").disabled = board.page >= board.pages;
++  const box = $("pg-pages");
++  box.innerHTML = "";
++  for (let p = 1; p <= board.pages; p++) {
++    // compact: first, last, current ±2
++    if (p !== 1 && p !== board.pages && Math.abs(p - board.page) > 2) {
++      if (!box.lastChild || box.lastChild.textContent !== "…") {
++        const dots = document.createElement("span");
++        dots.textContent = "…";
++        box.appendChild(dots);
++      }
++      continue;
++    }
++    const b = document.createElement("button");
++    b.type = "button";
++    b.className = "secondary page-btn" + (p === board.page ? " current" : "");
++    b.textContent = String(p);
++    b.addEventListener("click", () => goPage(p));
++    box.appendChild(b);
++  }
++  const from = board.total ? (board.page - 1) * board.perPage + 1 : 0;
++  const to = Math.min(board.total, board.page * board.perPage);
++  $("pg-info").textContent = `${from}–${to} из ${board.total}`;
++}
++
++async function goPage(p) {
++  board.page = p;
++  try { await loadEmployees(); } catch (err) { setMsg($("emp-msg"), err.message, false); }
++}
++
++$("pg-prev").addEventListener("click", () => goPage(board.page - 1));
++$("pg-next").addEventListener("click", () => goPage(board.page + 1));
++$("per-page").addEventListener("change", () => {
++  board.perPage = Number($("per-page").value);
++  localStorage.setItem("tt.perPage", String(board.perPage));
++  goPage(1);
++});
++
++$("btn-edit-mode").addEventListener("click", () => {
++  board.editMode = !board.editMode;
++  $("btn-edit-mode").textContent = board.editMode ? "Готово" : "Редактировать";
++  $("btn-edit-mode").className = board.editMode ? "" : "secondary";
++  $("edit-hint").hidden = !board.editMode;
++  setMsg($("emp-msg"), "", true);
++  renderBoard();
++});
++
++async function moveTo(id, toIndex) {
++  try {
++    await api(`/api/employees/${id}/move`, { method: "POST", body: JSON.stringify({ to_index: toIndex }) });
++    // follow the moved row if it left the current page
++    board.page = Math.floor(toIndex / board.perPage) + 1;
++    await loadEmployees();
++  } catch (err) {
++    setMsg($("emp-msg"), err.message, false);
++  }
++}
++
++function moveEmployee(id, delta) {
++  const e = employeesCache.find((x) => x.id === id);
++  if (!e) return;
++  const to = e.index + delta;
++  if (to < 0 || to >= board.total) return;
++  moveTo(id, to);
++}
++
++let dragId = null;
++function setupDrag(tr) {
++  tr.draggable = true;
++  tr.addEventListener("dragstart", (ev) => {
++    dragId = Number(tr.dataset.id);
++    tr.classList.add("dragging");
++    ev.dataTransfer.effectAllowed = "move";
++    ev.dataTransfer.setData("text/plain", tr.dataset.id);
++  });
++  tr.addEventListener("dragend", () => {
++    tr.classList.remove("dragging");
++    document.querySelectorAll(".drop-target").forEach((x) => x.classList.remove("drop-target"));
++  });
++  tr.addEventListener("dragover", (ev) => {
++    if (dragId == null) return;
++    ev.preventDefault();
++    document.querySelectorAll(".drop-target").forEach((x) => x.classList.remove("drop-target"));
++    tr.classList.add("drop-target");
++  });
++  tr.addEventListener("drop", (ev) => {
++    ev.preventDefault();
++    const id = dragId;
++    dragId = null;
++    const target = Number(tr.dataset.index);
++    if (id == null || id === Number(tr.dataset.id)) return;
++    moveTo(id, target);
+   });
+ }
+ 
+@@ -104,26 +249,24 @@ function escapeHtml(s) {
+     .replace(/"/g, "&quot;");
+ }
+ 
+-async function loadActive() {
+-  const rows = await api("/api/timers/active");
+-  const tbody = $("active-table");
+-  tbody.innerHTML = "";
+-  for (const r of rows) {
+-    const tr = document.createElement("tr");
+-    tr.innerHTML = `
+-      <td>${escapeHtml(r.employee_display_name)} <span class="badge running">идёт</span></td>
+-      <td>${escapeHtml(r.description)}</td>
+-      <td>${fmtLocal(r.start)}</td>`;
+-    tbody.appendChild(tr);
+-  }
+-  if (!rows.length) {
+-    tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">Нет активных таймеров</td></tr>`;
+-  }
+-}
++// live ticking of running timers
++setInterval(() => {
++  document.querySelectorAll(".timer.running[data-start]").forEach((el) => {
++    el.textContent = fmtDuration(elapsedSince(el.dataset.start));
++  });
++}, 1000);
++
++$("emp-name").addEventListener("input", () => {
++  $("btn-add-emp").disabled = !$("emp-name").value.trim();
++});
+ 
+ $("btn-add-emp").addEventListener("click", async () => {
+-  const name = $("emp-name").value;
+-  const title = $("emp-title").value;
++  const name = $("emp-name").value.trim();
++  const title = $("emp-title").value.trim();
++  if (!name) {
++    setMsg($("emp-msg"), "Укажите имя сотрудника", false);
++    return;
++  }
+   try {
+     await api("/api/employees", {
+       method: "POST",
+@@ -131,42 +274,70 @@ $("btn-add-emp").addEventListener("click", async () => {
+     });
+     $("emp-name").value = "";
+     $("emp-title").value = "";
+-    setMsg($("emp-msg"), "Добавлен", true);
++    $("btn-add-emp").disabled = true;
++    setMsg($("emp-msg"), "Сотрудник добавлен", true);
++    // jump to the last page where the new employee is
++    board.page = Math.max(1, Math.ceil((board.total + 1) / board.perPage));
+     await loadEmployees();
+   } catch (err) {
+     setMsg($("emp-msg"), err.message, false);
+   }
+ });
+ 
+-$("btn-start").addEventListener("click", async () => {
+-  const employee_id = Number($("timer-emp").value);
+-  const description = $("timer-desc").value;
++function openStartModal(id) {
++  const e = employeesCache.find((x) => x.id === id);
++  if (!e) return;
++  $("start-id").value = String(id);
++  $("start-who").textContent = e.title ? `${e.name} — ${e.title}` : e.name;
++  $("start-desc").value = "";
++  $("btn-start-go").disabled = true;
++  setMsg($("start-msg"), "", true);
++  $("start-modal").classList.add("open");
++  setTimeout(() => $("start-desc").focus(), 0);
++}
++
++$("start-desc").addEventListener("input", () => {
++  $("btn-start-go").disabled = !$("start-desc").value.trim();
++});
++$("start-desc").addEventListener("keydown", (ev) => {
++  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey) && !$("btn-start-go").disabled) $("btn-start-go").click();
++});
++$("btn-start-cancel").addEventListener("click", () => $("start-modal").classList.remove("open"));
++
++$("btn-start-go").addEventListener("click", async () => {
++  const employee_id = Number($("start-id").value);
++  const description = $("start-desc").value.trim();
++  if (!description) {
++    $("btn-start-go").disabled = true;
++    return;
++  }
++  $("btn-start-go").disabled = true;
+   try {
+     await api("/api/timers/start", {
+       method: "POST",
+       body: JSON.stringify({ employee_id, description }),
+     });
+-    setMsg($("timer-msg"), "Таймер запущен", true);
+-    $("timer-desc").value = "";
+-    await loadActive();
++    $("start-modal").classList.remove("open");
++    setMsg($("emp-msg"), "Таймер запущен", true);
++    await loadEmployees();
+   } catch (err) {
+-    setMsg($("timer-msg"), err.message, false);
++    setMsg($("start-msg"), err.message, false);
++    $("btn-start-go").disabled = !$("start-desc").value.trim();
+   }
+ });
+ 
+-$("btn-stop").addEventListener("click", async () => {
+-  const employee_id = Number($("timer-emp").value);
++async function stopTimer(employee_id) {
+   try {
+     const entry = await api("/api/timers/stop", {
+       method: "POST",
+       body: JSON.stringify({ employee_id }),
+     });
+-    setMsg($("timer-msg"), `Остановлен · ${entry.duration_seconds} сек`, true);
+-    await loadActive();
++    setMsg($("emp-msg"), `Таймер остановлен · ${fmtDuration(entry.duration_seconds)}`, true);
++    await loadEmployees();
+   } catch (err) {
+-    setMsg($("timer-msg"), err.message, false);
++    setMsg($("emp-msg"), err.message, false);
+   }
+-});
++}
+ 
+ function defaultPeriod() {
+   const now = new Date();
+@@ -182,7 +353,7 @@ async function runReport() {
+   const from = fromDatetimeLocal($("rep-from").value);
+   const to = fromDatetimeLocal($("rep-to").value);
+   if (!from || !to) {
+-    setMsg($("report-msg"), "Укажите период from–to", false);
++    setMsg($("report-msg"), "Укажите период: дату «С» и «По»", false);
+     return;
+   }
+   try {
+@@ -272,8 +443,9 @@ function openDeleteModal(id) {
+   const e = employeesCache.find((x) => x.id === id);
+   if (!e) return;
+   $("del-id").value = String(id);
++  const running = e.active_timer ? " У сотрудника идёт таймер — он будет остановлен." : "";
+   $("del-text").textContent =
+-    `Сотрудник «${e.name}». «Без истории» — мягкое удаление (записи остаются, в отчёте пометка «удалён»). «С историей» — удалить сотрудника и все его записи.`;
++    `Сотрудник «${e.name}».${running} «Без истории» — мягкое удаление (записи остаются, в отчёте пометка «удалён»). «С историей» — удалить сотрудника и все его записи.`;
+   setMsg($("del-msg"), "", true);
+   $("del-modal").classList.add("open");
+ }
+@@ -287,9 +459,8 @@ async function doDelete(withHistory) {
+   try {
+     await api(`/api/employees/${id}?with_history=${withHistory}`, { method: "DELETE" });
+     $("del-modal").classList.remove("open");
+-    setMsg($("emp-msg"), "Удалён", true);
++    setMsg($("emp-msg"), "Сотрудник удалён", true);
+     await loadEmployees();
+-    await loadActive();
+   } catch (err) {
+     setMsg($("del-msg"), err.message, false);
+   }
+@@ -302,7 +473,6 @@ $("btn-del-hard").addEventListener("click", () => doDelete(true));
+   defaultPeriod();
+   try {
+     await loadEmployees();
+-    await loadActive();
+   } catch (err) {
+     setMsg($("emp-msg"), err.message, false);
+   }
+diff --git a/app/static/index.html b/app/static/index.html
+index a4dc173..6b21158 100644
+--- a/app/static/index.html
++++ b/app/static/index.html
+@@ -14,53 +14,52 @@
+   </header>
+ 
+   <main>
+-    <div class="grid-2">
+-      <section class="card">
+-        <h2>Сотрудники</h2>
+-        <div class="row">
+-          <div>
+-            <label for="emp-name">Имя</label>
+-            <input id="emp-name" placeholder="Имя сотрудника" />
+-          </div>
+-          <div>
+-            <label for="emp-title">Должность (необяз.)</label>
+-            <input id="emp-title" placeholder="Должность" />
+-          </div>
++    <section class="card">
++      <div class="card-head">
++        <h2>Сотрудники и таймеры</h2>
++        <button id="btn-edit-mode" type="button" class="secondary">Редактировать</button>
++      </div>
++      <div class="row add-row">
++        <div>
++          <label for="emp-name">Имя</label>
++          <input id="emp-name" placeholder="Имя сотрудника" maxlength="200" />
+         </div>
+-        <button id="btn-add-emp" type="button">Добавить</button>
+-        <p id="emp-msg" class="msg"></p>
+-        <div style="overflow-x:auto; margin-top:0.75rem">
+-          <table>
+-            <thead>
+-              <tr><th>Имя</th><th>Должность</th><th></th></tr>
+-            </thead>
+-            <tbody id="emp-table"></tbody>
+-          </table>
++        <div>
++          <label for="emp-title">Должность (необяз.)</label>
++          <input id="emp-title" placeholder="Должность" maxlength="200" />
+         </div>
+-      </section>
+-
+-      <section class="card">
+-        <h2>Таймер</h2>
+-        <label for="timer-emp">Сотрудник</label>
+-        <select id="timer-emp"></select>
+-        <label for="timer-desc">Задача (до 500 символов)</label>
+-        <textarea id="timer-desc" maxlength="500" placeholder="Что делаем?"></textarea>
+-        <div class="row">
+-          <button id="btn-start" type="button">Старт</button>
+-          <button id="btn-stop" type="button" class="secondary">Стоп</button>
++        <div style="flex:0">
++          <label>&nbsp;</label>
++          <button id="btn-add-emp" type="button" disabled>Добавить</button>
+         </div>
+-        <p id="timer-msg" class="msg"></p>
+-        <h2 style="margin-top:1rem">Активные</h2>
+-        <div style="overflow-x:auto">
+-          <table>
+-            <thead>
+-              <tr><th>Сотрудник</th><th>Задача</th><th>Старт</th></tr>
+-            </thead>
+-            <tbody id="active-table"></tbody>
+-          </table>
++      </div>
++      <p id="emp-msg" class="msg"></p>
++      <p id="edit-hint" class="hint" hidden>Режим редактирования: перетаскивайте строки за ⠿ или двигайте стрелками, таймеры скрыты. При удалении сотрудника его таймер останавливается.</p>
++      <div style="overflow-x:auto">
++        <table class="board">
++          <thead>
++            <tr><th class="col-handle"></th><th>Сотрудник</th><th>Задача</th><th>Время</th><th></th></tr>
++          </thead>
++          <tbody id="emp-table"></tbody>
++        </table>
++      </div>
++      <div class="pager">
++        <div class="pager-size">
++          <label for="per-page">На странице</label>
++          <select id="per-page">
++            <option value="10">10</option>
++            <option value="20">20</option>
++            <option value="50">50</option>
++          </select>
+         </div>
+-      </section>
+-    </div>
++        <div class="pager-nav">
++          <button id="pg-prev" type="button" class="secondary">‹</button>
++          <span id="pg-pages"></span>
++          <button id="pg-next" type="button" class="secondary">›</button>
++        </div>
++        <span id="pg-info" class="hint"></span>
++      </div>
++    </section>
+ 
+     <section class="card">
+       <h2>Отчёт за период</h2>
+@@ -116,6 +115,21 @@
+     </div>
+   </div>
+ 
++  <div id="start-modal" class="modal-backdrop" role="dialog" aria-modal="true">
++    <div class="modal">
++      <h3>Запустить таймер</h3>
++      <p id="start-who" style="color:var(--muted);font-size:0.9rem"></p>
++      <input type="hidden" id="start-id" />
++      <label for="start-desc">Описание задачи (до 500 символов)</label>
++      <textarea id="start-desc" maxlength="500" placeholder="Что делаем?"></textarea>
++      <p id="start-msg" class="msg"></p>
++      <div class="row">
++        <button id="btn-start-go" type="button" disabled>Старт</button>
++        <button id="btn-start-cancel" type="button" class="secondary">Отмена</button>
++      </div>
++    </div>
++  </div>
++
+   <div id="del-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+     <div class="modal">
+       <h3>Удалить сотрудника</h3>
+diff --git a/app/static/style.css b/app/static/style.css
+index dde7764..084a958 100644
+--- a/app/static/style.css
++++ b/app/static/style.css
+@@ -194,3 +194,29 @@ th { color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform:
+   width: min(480px, 100%);
+ }
+ .modal h3 { margin: 0 0 0.75rem; }
++
++/* ---- combined employees/timers board ---- */
++.card-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.85rem; }
++.card-head h2 { margin: 0; }
++.add-row { align-items: flex-end; }
++.hint { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0; }
++.board td { vertical-align: middle; }
++.board .col-handle { width: 1.6rem; }
++.board .handle { cursor: grab; color: var(--muted); user-select: none; font-size: 1.1rem; }
++.board .timer { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; white-space: nowrap; }
++.board .timer.running { color: var(--ok); font-weight: 600; }
++.board .task { color: var(--muted); max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.board .emp-title { display: block; color: var(--muted); font-size: 0.8rem; }
++.board tr.dragging { opacity: 0.4; }
++.board tr.drop-target td { border-top: 2px solid var(--accent); }
++.board .actions { white-space: nowrap; text-align: right; }
++.board .actions button { margin-left: 0.3rem; }
++.icon-btn { padding: 0.3rem 0.55rem; }
++.pager { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }
++.pager-size { display: flex; align-items: center; gap: 0.5rem; }
++.pager-size label { margin: 0; }
++.pager-size select { width: auto; }
++.pager-nav { display: flex; align-items: center; gap: 0.3rem; }
++.pager-nav button { padding: 0.3rem 0.6rem; }
++.pager-nav .page-btn.current { background: var(--accent); color: #fff; border-color: var(--accent); }
++button:disabled { opacity: 0.45; cursor: not-allowed; }
+diff --git a/tests/test_core.py b/tests/test_core.py
+index a13ce78..ac2d631 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -10,6 +10,7 @@ from app.services import (
+     AppError,
+     create_employee,
+     delete_employee,
++    list_active_timers,
+     report,
+     start_timer,
+     stop_timer,
+@@ -40,7 +41,7 @@ def test_invalid_period_from_after_to(conn):
+         report(conn, _iso(frm), _iso(to))
+         assert False, "expected AppError"
+     except AppError as e:
+-        assert "from" in e.message.lower() or "period" in e.message.lower()
++        assert "Неверный период" in e.message
+ 
+ 
+ def test_period_clipping(conn):
+@@ -94,7 +95,7 @@ def test_duplicate_start_rejected(conn):
+         start_timer(conn, emp["id"], "Task B")
+         assert False, "expected AppError"
+     except AppError as e:
+-        assert "active" in e.message.lower()
++        assert "уже запущен" in e.message
+ 
+ 
+ def test_duplicate_start_rejected_via_api(client, conn):
+@@ -105,7 +106,7 @@ def test_duplicate_start_rejected_via_api(client, conn):
+     assert r1.status_code == 201
+     r2 = client.post("/api/timers/start", json={"employee_id": eid, "description": "Two"})
+     assert r2.status_code == 400
+-    assert "active" in r2.json()["detail"].lower()
++    assert r2.json()["detail"] == "У сотрудника уже запущен таймер"
+ 
+ 
+ def test_concurrent_start_race(db_path):
+@@ -143,19 +144,23 @@ def test_concurrent_start_race(db_path):
+     assert len(errs) == 7, results
+ 
+ 
+-def test_delete_with_active_forbidden(conn):
++def test_delete_stops_active_timer(conn):
+     emp = create_employee(conn, "Frank")
++    entry = start_timer(conn, emp["id"], "Busy")
++    delete_employee(conn, emp["id"], with_history=False)
++    row = conn.execute(
++        "SELECT end_ts, duration_seconds FROM time_entries WHERE id = ?", (entry["id"],)
++    ).fetchone()
++    assert row["end_ts"] is not None
++    assert row["duration_seconds"] is not None
++    assert list_active_timers(conn) == []
++
++
++def test_hard_delete_with_active_timer(conn):
++    emp = create_employee(conn, "Frank2")
+     start_timer(conn, emp["id"], "Busy")
+-    try:
+-        delete_employee(conn, emp["id"], with_history=False)
+-        assert False, "expected AppError"
+-    except AppError as e:
+-        assert "active" in e.message.lower()
+-    try:
+-        delete_employee(conn, emp["id"], with_history=True)
+-        assert False, "expected AppError"
+-    except AppError as e:
+-        assert "active" in e.message.lower()
++    delete_employee(conn, emp["id"], with_history=True)
++    assert conn.execute("SELECT COUNT(*) AS c FROM time_entries").fetchone()["c"] == 0
+ 
+ 
+ def test_duration_recalc_on_edit(conn):
+@@ -201,7 +206,7 @@ def test_edit_end_before_start_error(conn):
+         )
+         assert False, "expected AppError"
+     except AppError as e:
+-        assert "end" in e.message.lower() or "before" in e.message.lower()
++        assert "раньше начала" in e.message
+ 
+ 
+ def test_edit_start_of_running_forbidden(conn):
+@@ -212,7 +217,7 @@ def test_edit_start_of_running_forbidden(conn):
+         update_entry(conn, entry["id"], start=_iso(new_start))
+         assert False, "expected AppError"
+     except AppError as e:
+-        assert "running" in e.message.lower() or "forbidden" in e.message.lower()
++        assert "идущего" in e.message
+ 
+ 
+ def test_stop_with_no_active(conn):
+@@ -221,7 +226,7 @@ def test_stop_with_no_active(conn):
+         stop_timer(conn, emp["id"])
+         assert False, "expected AppError"
+     except AppError as e:
+-        assert "no active" in e.message.lower()
++        assert "нет запущенного" in e.message
+ 
+ 
+ def test_empty_name_rejected(client):
+@@ -285,3 +290,48 @@ def test_hard_delete_removes_entries(conn):
+     )
+     assert result["entries"] == []
+     assert conn.execute("SELECT COUNT(*) AS c FROM employees WHERE id = ?", (emp["id"],)).fetchone()["c"] == 0
++
++
++def test_empty_description_is_russian_not_raw_json(client):
++    eid = client.post("/api/employees", json={"name": "Lena"}).json()["id"]
++    r = client.post("/api/timers/start", json={"employee_id": eid, "description": ""})
++    assert r.status_code == 400
++    assert r.json() == {"detail": "Введите описание задачи"}
++
++
++def test_validation_errors_are_russian_strings(client):
++    r = client.post("/api/timers/start", json={"description": "x"})
++    assert r.status_code == 422
++    detail = r.json()["detail"]
++    assert isinstance(detail, str)
++    assert "Сотрудник" in detail
++    r = client.post("/api/timers/start", json={"employee_id": "abc", "description": "x"})
++    assert isinstance(r.json()["detail"], str)
++    assert "числом" in r.json()["detail"]
++    r = client.get("/api/nope")
++    assert r.json()["detail"] == "Не найдено"
++
++
++def test_board_pagination_and_active_timer(client, conn):
++    ids = [client.post("/api/employees", json={"name": f"E{i}"}).json()["id"] for i in range(25)]
++    start_timer(conn, ids[0], "Work")
++    b = client.get("/api/employees/board?page=1&per_page=10").json()
++    assert b["total"] == 25 and b["pages"] == 3 and len(b["items"]) == 10
++    assert b["items"][0]["active_timer"]["description"] == "Work"
++    assert b["items"][1]["active_timer"] is None
++    b3 = client.get("/api/employees/board?page=3&per_page=10").json()
++    assert len(b3["items"]) == 5
++    assert len(client.get("/api/employees/board?per_page=50").json()["items"]) == 25
++    r = client.get("/api/employees/board?per_page=7")
++    assert r.status_code == 400
++    assert "10, 20 или 50" in r.json()["detail"]
++
++
++def test_move_employee_reorders(client):
++    ids = [client.post("/api/employees", json={"name": n}).json()["id"] for n in "ABCD"]
++    r = client.post(f"/api/employees/{ids[3]}/move", json={"to_index": 0})
++    assert r.status_code == 200
++    assert [e["name"] for e in r.json()] == ["D", "A", "B", "C"]
++    client.post(f"/api/employees/{ids[3]}/move", json={"to_index": 99})
++    names = [e["name"] for e in client.get("/api/employees").json()]
++    assert names == ["A", "B", "C", "D"]
+-- 
+2.47.3
+

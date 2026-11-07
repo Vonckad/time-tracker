@@ -8,16 +8,21 @@ function setMsg(el, text, ok) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      ...opts,
+    });
+  } catch {
+    throw new Error("Нет связи с сервером. Проверьте, что приложение запущено.");
+  }
   let data = null;
   const text = await res.text();
   try { data = text ? JSON.parse(text) : null; } catch { data = { detail: text }; }
   if (!res.ok) {
-    const detail = data && data.detail != null ? data.detail : res.statusText;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const detail = data && data.detail != null ? data.detail : null;
+    throw new Error(typeof detail === "string" && detail ? detail : "Ошибка сервера (" + res.status + "). Попробуйте ещё раз.");
   }
   return data;
 }
@@ -63,36 +68,176 @@ function nameColorMap(employees) {
 }
 
 let employeesCache = [];
+const board = { page: 1, perPage: Number(localStorage.getItem("tt.perPage")) || 10, pages: 1, total: 0, editMode: false, clockSkew: 0 };
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+function elapsedSince(iso) {
+  return (Date.now() + board.clockSkew - new Date(iso).getTime()) / 1000;
+}
 
 async function loadEmployees() {
-  employeesCache = await api("/api/employees");
+  const q = new URLSearchParams({ page: board.page, per_page: board.perPage });
+  const data = await api(`/api/employees/board?${q}`);
+  board.clockSkew = new Date(data.server_time).getTime() - Date.now();
+  board.page = data.page;
+  board.pages = data.pages;
+  board.total = data.total;
+  employeesCache = data.items;
+  renderBoard();
+}
+
+function renderBoard() {
   const colors = nameColorMap(employeesCache);
   const tbody = $("emp-table");
   tbody.innerHTML = "";
-  const sel = $("timer-emp");
-  const prev = sel.value;
-  sel.innerHTML = "";
+  const edit = board.editMode;
 
-  for (const e of employeesCache) {
+  employeesCache.forEach((e, i) => {
+    const t = e.active_timer;
     const tr = document.createElement("tr");
+    tr.dataset.id = e.id;
+    tr.dataset.index = e.index;
     if (colors[e.id] != null) tr.className = `emp-color-${colors[e.id]}`;
+    const timeCell = t
+      ? `<span class="timer running" data-start="${escapeHtml(t.start)}">${fmtDuration(elapsedSince(t.start))}</span>`
+      : `<span class="timer">00:00:00</span>`;
+    const isFirst = e.index === 0;
+    const isLast = e.index === board.total - 1;
+    const actions = edit
+      ? `<button type="button" class="secondary icon-btn" data-up="${e.id}" ${isFirst ? "disabled" : ""} title="Выше">↑</button>
+         <button type="button" class="secondary icon-btn" data-down="${e.id}" ${isLast ? "disabled" : ""} title="Ниже">↓</button>
+         <button type="button" class="danger" data-del="${e.id}">Удалить</button>`
+      : t
+        ? `<button type="button" class="secondary" data-stop="${e.id}">Стоп</button>`
+        : `<button type="button" data-start="${e.id}">Старт</button>`;
     tr.innerHTML = `
-      <td>${escapeHtml(e.name)}</td>
-      <td>${escapeHtml(e.title || "—")}</td>
-      <td class="actions">
-        <button type="button" class="danger" data-del="${e.id}">Удалить</button>
-      </td>`;
+      <td class="col-handle">${edit ? '<span class="handle" title="Перетащить">⠿</span>' : ""}</td>
+      <td>${escapeHtml(e.name)}<span class="emp-title">${escapeHtml(e.title || "")}</span></td>
+      <td class="task" title="${t ? escapeHtml(t.description) : ""}">${t ? escapeHtml(t.description) : "—"}</td>
+      <td>${timeCell}</td>
+      <td class="actions">${actions}</td>`;
+    if (edit) setupDrag(tr);
     tbody.appendChild(tr);
+  });
 
-    const opt = document.createElement("option");
-    opt.value = e.id;
-    opt.textContent = e.title ? `${e.name} — ${e.title}` : e.name;
-    sel.appendChild(opt);
+  if (!employeesCache.length) {
+    tbody.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">Сотрудников пока нет — добавьте первого</td></tr>`;
   }
-  if (prev) sel.value = prev;
 
-  tbody.querySelectorAll("[data-del]").forEach((btn) => {
-    btn.addEventListener("click", () => openDeleteModal(Number(btn.dataset.del)));
+  tbody.querySelectorAll("[data-start]").forEach((btn) => {
+    if (btn.tagName === "BUTTON") btn.addEventListener("click", () => openStartModal(Number(btn.dataset.start)));
+  });
+  tbody.querySelectorAll("[data-stop]").forEach((btn) => btn.addEventListener("click", () => stopTimer(Number(btn.dataset.stop))));
+  tbody.querySelectorAll("[data-del]").forEach((btn) => btn.addEventListener("click", () => openDeleteModal(Number(btn.dataset.del))));
+  tbody.querySelectorAll("[data-up]").forEach((btn) => btn.addEventListener("click", () => moveEmployee(Number(btn.dataset.up), -1)));
+  tbody.querySelectorAll("[data-down]").forEach((btn) => btn.addEventListener("click", () => moveEmployee(Number(btn.dataset.down), 1)));
+
+  renderPager();
+}
+
+function renderPager() {
+  $("per-page").value = String(board.perPage);
+  $("pg-prev").disabled = board.page <= 1;
+  $("pg-next").disabled = board.page >= board.pages;
+  const box = $("pg-pages");
+  box.innerHTML = "";
+  for (let p = 1; p <= board.pages; p++) {
+    // compact: first, last, current ±2
+    if (p !== 1 && p !== board.pages && Math.abs(p - board.page) > 2) {
+      if (!box.lastChild || box.lastChild.textContent !== "…") {
+        const dots = document.createElement("span");
+        dots.textContent = "…";
+        box.appendChild(dots);
+      }
+      continue;
+    }
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "secondary page-btn" + (p === board.page ? " current" : "");
+    b.textContent = String(p);
+    b.addEventListener("click", () => goPage(p));
+    box.appendChild(b);
+  }
+  const from = board.total ? (board.page - 1) * board.perPage + 1 : 0;
+  const to = Math.min(board.total, board.page * board.perPage);
+  $("pg-info").textContent = `${from}–${to} из ${board.total}`;
+}
+
+async function goPage(p) {
+  board.page = p;
+  try { await loadEmployees(); } catch (err) { setMsg($("emp-msg"), err.message, false); }
+}
+
+$("pg-prev").addEventListener("click", () => goPage(board.page - 1));
+$("pg-next").addEventListener("click", () => goPage(board.page + 1));
+$("per-page").addEventListener("change", () => {
+  board.perPage = Number($("per-page").value);
+  localStorage.setItem("tt.perPage", String(board.perPage));
+  goPage(1);
+});
+
+$("btn-edit-mode").addEventListener("click", () => {
+  board.editMode = !board.editMode;
+  $("btn-edit-mode").textContent = board.editMode ? "Готово" : "Редактировать";
+  $("btn-edit-mode").className = board.editMode ? "" : "secondary";
+  $("edit-hint").hidden = !board.editMode;
+  setMsg($("emp-msg"), "", true);
+  renderBoard();
+});
+
+async function moveTo(id, toIndex) {
+  try {
+    await api(`/api/employees/${id}/move`, { method: "POST", body: JSON.stringify({ to_index: toIndex }) });
+    // follow the moved row if it left the current page
+    board.page = Math.floor(toIndex / board.perPage) + 1;
+    await loadEmployees();
+  } catch (err) {
+    setMsg($("emp-msg"), err.message, false);
+  }
+}
+
+function moveEmployee(id, delta) {
+  const e = employeesCache.find((x) => x.id === id);
+  if (!e) return;
+  const to = e.index + delta;
+  if (to < 0 || to >= board.total) return;
+  moveTo(id, to);
+}
+
+let dragId = null;
+function setupDrag(tr) {
+  tr.draggable = true;
+  tr.addEventListener("dragstart", (ev) => {
+    dragId = Number(tr.dataset.id);
+    tr.classList.add("dragging");
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("text/plain", tr.dataset.id);
+  });
+  tr.addEventListener("dragend", () => {
+    tr.classList.remove("dragging");
+    document.querySelectorAll(".drop-target").forEach((x) => x.classList.remove("drop-target"));
+  });
+  tr.addEventListener("dragover", (ev) => {
+    if (dragId == null) return;
+    ev.preventDefault();
+    document.querySelectorAll(".drop-target").forEach((x) => x.classList.remove("drop-target"));
+    tr.classList.add("drop-target");
+  });
+  tr.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    const id = dragId;
+    dragId = null;
+    const target = Number(tr.dataset.index);
+    if (id == null || id === Number(tr.dataset.id)) return;
+    moveTo(id, target);
   });
 }
 
@@ -104,26 +249,24 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-async function loadActive() {
-  const rows = await api("/api/timers/active");
-  const tbody = $("active-table");
-  tbody.innerHTML = "";
-  for (const r of rows) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${escapeHtml(r.employee_display_name)} <span class="badge running">идёт</span></td>
-      <td>${escapeHtml(r.description)}</td>
-      <td>${fmtLocal(r.start)}</td>`;
-    tbody.appendChild(tr);
-  }
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="3" style="color:var(--muted)">Нет активных таймеров</td></tr>`;
-  }
-}
+// live ticking of running timers
+setInterval(() => {
+  document.querySelectorAll(".timer.running[data-start]").forEach((el) => {
+    el.textContent = fmtDuration(elapsedSince(el.dataset.start));
+  });
+}, 1000);
+
+$("emp-name").addEventListener("input", () => {
+  $("btn-add-emp").disabled = !$("emp-name").value.trim();
+});
 
 $("btn-add-emp").addEventListener("click", async () => {
-  const name = $("emp-name").value;
-  const title = $("emp-title").value;
+  const name = $("emp-name").value.trim();
+  const title = $("emp-title").value.trim();
+  if (!name) {
+    setMsg($("emp-msg"), "Укажите имя сотрудника", false);
+    return;
+  }
   try {
     await api("/api/employees", {
       method: "POST",
@@ -131,42 +274,70 @@ $("btn-add-emp").addEventListener("click", async () => {
     });
     $("emp-name").value = "";
     $("emp-title").value = "";
-    setMsg($("emp-msg"), "Добавлен", true);
+    $("btn-add-emp").disabled = true;
+    setMsg($("emp-msg"), "Сотрудник добавлен", true);
+    // jump to the last page where the new employee is
+    board.page = Math.max(1, Math.ceil((board.total + 1) / board.perPage));
     await loadEmployees();
   } catch (err) {
     setMsg($("emp-msg"), err.message, false);
   }
 });
 
-$("btn-start").addEventListener("click", async () => {
-  const employee_id = Number($("timer-emp").value);
-  const description = $("timer-desc").value;
+function openStartModal(id) {
+  const e = employeesCache.find((x) => x.id === id);
+  if (!e) return;
+  $("start-id").value = String(id);
+  $("start-who").textContent = e.title ? `${e.name} — ${e.title}` : e.name;
+  $("start-desc").value = "";
+  $("btn-start-go").disabled = true;
+  setMsg($("start-msg"), "", true);
+  $("start-modal").classList.add("open");
+  setTimeout(() => $("start-desc").focus(), 0);
+}
+
+$("start-desc").addEventListener("input", () => {
+  $("btn-start-go").disabled = !$("start-desc").value.trim();
+});
+$("start-desc").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey) && !$("btn-start-go").disabled) $("btn-start-go").click();
+});
+$("btn-start-cancel").addEventListener("click", () => $("start-modal").classList.remove("open"));
+
+$("btn-start-go").addEventListener("click", async () => {
+  const employee_id = Number($("start-id").value);
+  const description = $("start-desc").value.trim();
+  if (!description) {
+    $("btn-start-go").disabled = true;
+    return;
+  }
+  $("btn-start-go").disabled = true;
   try {
     await api("/api/timers/start", {
       method: "POST",
       body: JSON.stringify({ employee_id, description }),
     });
-    setMsg($("timer-msg"), "Таймер запущен", true);
-    $("timer-desc").value = "";
-    await loadActive();
+    $("start-modal").classList.remove("open");
+    setMsg($("emp-msg"), "Таймер запущен", true);
+    await loadEmployees();
   } catch (err) {
-    setMsg($("timer-msg"), err.message, false);
+    setMsg($("start-msg"), err.message, false);
+    $("btn-start-go").disabled = !$("start-desc").value.trim();
   }
 });
 
-$("btn-stop").addEventListener("click", async () => {
-  const employee_id = Number($("timer-emp").value);
+async function stopTimer(employee_id) {
   try {
     const entry = await api("/api/timers/stop", {
       method: "POST",
       body: JSON.stringify({ employee_id }),
     });
-    setMsg($("timer-msg"), `Остановлен · ${entry.duration_seconds} сек`, true);
-    await loadActive();
+    setMsg($("emp-msg"), `Таймер остановлен · ${fmtDuration(entry.duration_seconds)}`, true);
+    await loadEmployees();
   } catch (err) {
-    setMsg($("timer-msg"), err.message, false);
+    setMsg($("emp-msg"), err.message, false);
   }
-});
+}
 
 function defaultPeriod() {
   const now = new Date();
@@ -182,7 +353,7 @@ async function runReport() {
   const from = fromDatetimeLocal($("rep-from").value);
   const to = fromDatetimeLocal($("rep-to").value);
   if (!from || !to) {
-    setMsg($("report-msg"), "Укажите период from–to", false);
+    setMsg($("report-msg"), "Укажите период: дату «С» и «По»", false);
     return;
   }
   try {
@@ -272,8 +443,9 @@ function openDeleteModal(id) {
   const e = employeesCache.find((x) => x.id === id);
   if (!e) return;
   $("del-id").value = String(id);
+  const running = e.active_timer ? " У сотрудника идёт таймер — он будет остановлен." : "";
   $("del-text").textContent =
-    `Сотрудник «${e.name}». «Без истории» — мягкое удаление (записи остаются, в отчёте пометка «удалён»). «С историей» — удалить сотрудника и все его записи.`;
+    `Сотрудник «${e.name}».${running} «Без истории» — мягкое удаление (записи остаются, в отчёте пометка «удалён»). «С историей» — удалить сотрудника и все его записи.`;
   setMsg($("del-msg"), "", true);
   $("del-modal").classList.add("open");
 }
@@ -287,9 +459,8 @@ async function doDelete(withHistory) {
   try {
     await api(`/api/employees/${id}?with_history=${withHistory}`, { method: "DELETE" });
     $("del-modal").classList.remove("open");
-    setMsg($("emp-msg"), "Удалён", true);
+    setMsg($("emp-msg"), "Сотрудник удалён", true);
     await loadEmployees();
-    await loadActive();
   } catch (err) {
     setMsg($("del-msg"), err.message, false);
   }
@@ -302,7 +473,6 @@ $("btn-del-hard").addEventListener("click", () => doDelete(true));
   defaultPeriod();
   try {
     await loadEmployees();
-    await loadActive();
   } catch (err) {
     setMsg($("emp-msg"), err.message, false);
   }

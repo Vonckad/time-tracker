@@ -194,3 +194,29 @@ th { color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: 
   width: min(480px, 100%);
 }
 .modal h3 { margin: 0 0 0.75rem; }
+
+/* ---- combined employees/timers board ---- */
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.85rem; }
+.card-head h2 { margin: 0; }
+.add-row { align-items: flex-end; }
+.hint { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0; }
+.board td { vertical-align: middle; }
+.board .col-handle { width: 1.6rem; }
+.board .handle { cursor: grab; color: var(--muted); user-select: none; font-size: 1.1rem; }
+.board .timer { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; white-space: nowrap; }
+.board .timer.running { color: var(--ok); font-weight: 600; }
+.board .task { color: var(--muted); max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board .emp-title { display: block; color: var(--muted); font-size: 0.8rem; }
+.board tr.dragging { opacity: 0.4; }
+.board tr.drop-target td { border-top: 2px solid var(--accent); }
+.board .actions { white-space: nowrap; text-align: right; }
+.board .actions button { margin-left: 0.3rem; }
+.icon-btn { padding: 0.3rem 0.55rem; }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }
+.pager-size { display: flex; align-items: center; gap: 0.5rem; }
+.pager-size label { margin: 0; }
+.pager-size select { width: auto; }
+.pager-nav { display: flex; align-items: center; gap: 0.3rem; }
+.pager-nav button { padding: 0.3rem 0.6rem; }
+.pager-nav .page-btn.current { background: var(--accent); color: #fff; border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }

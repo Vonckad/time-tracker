@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -13,6 +15,7 @@ from app.db import init_db
 from app.deps import get_db, set_db_path
 from app.routers import employees, reports, timers
 from app.services import AppError
+from app.errors import validation_message, http_message
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -33,6 +36,21 @@ app = FastAPI(title="Time Tracker", version="1.0.0", lifespan=lifespan)
 @app.exception_handler(AppError)
 async def app_error_handler(_request: Request, exc: AppError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_request: Request, exc: RequestValidationError):
+    # Never leak raw pydantic error lists to the UI: one readable Russian message.
+    return JSONResponse(status_code=422, content={"detail": validation_message(exc.errors())})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(_request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": http_message(exc.status_code, exc.detail)},
+        headers=getattr(exc, "headers", None),
+    )
 
 
 app.include_router(employees.router)

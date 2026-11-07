@@ -10,6 +10,7 @@ from app.services import (
     AppError,
     create_employee,
     delete_employee,
+    list_active_timers,
     report,
     start_timer,
     stop_timer,
@@ -40,7 +41,7 @@ def test_invalid_period_from_after_to(conn):
         report(conn, _iso(frm), _iso(to))
         assert False, "expected AppError"
     except AppError as e:
-        assert "from" in e.message.lower() or "period" in e.message.lower()
+        assert "Неверный период" in e.message
 
 
 def test_period_clipping(conn):
@@ -94,7 +95,7 @@ def test_duplicate_start_rejected(conn):
         start_timer(conn, emp["id"], "Task B")
         assert False, "expected AppError"
     except AppError as e:
-        assert "active" in e.message.lower()
+        assert "уже запущен" in e.message
 
 
 def test_duplicate_start_rejected_via_api(client, conn):
@@ -105,7 +106,7 @@ def test_duplicate_start_rejected_via_api(client, conn):
     assert r1.status_code == 201
     r2 = client.post("/api/timers/start", json={"employee_id": eid, "description": "Two"})
     assert r2.status_code == 400
-    assert "active" in r2.json()["detail"].lower()
+    assert r2.json()["detail"] == "У сотрудника уже запущен таймер"
 
 
 def test_concurrent_start_race(db_path):
@@ -143,19 +144,23 @@ def test_concurrent_start_race(db_path):
     assert len(errs) == 7, results
 
 
-def test_delete_with_active_forbidden(conn):
+def test_delete_stops_active_timer(conn):
     emp = create_employee(conn, "Frank")
+    entry = start_timer(conn, emp["id"], "Busy")
+    delete_employee(conn, emp["id"], with_history=False)
+    row = conn.execute(
+        "SELECT end_ts, duration_seconds FROM time_entries WHERE id = ?", (entry["id"],)
+    ).fetchone()
+    assert row["end_ts"] is not None
+    assert row["duration_seconds"] is not None
+    assert list_active_timers(conn) == []
+
+
+def test_hard_delete_with_active_timer(conn):
+    emp = create_employee(conn, "Frank2")
     start_timer(conn, emp["id"], "Busy")
-    try:
-        delete_employee(conn, emp["id"], with_history=False)
-        assert False, "expected AppError"
-    except AppError as e:
-        assert "active" in e.message.lower()
-    try:
-        delete_employee(conn, emp["id"], with_history=True)
-        assert False, "expected AppError"
-    except AppError as e:
-        assert "active" in e.message.lower()
+    delete_employee(conn, emp["id"], with_history=True)
+    assert conn.execute("SELECT COUNT(*) AS c FROM time_entries").fetchone()["c"] == 0
 
 
 def test_duration_recalc_on_edit(conn):
@@ -201,7 +206,7 @@ def test_edit_end_before_start_error(conn):
         )
         assert False, "expected AppError"
     except AppError as e:
-        assert "end" in e.message.lower() or "before" in e.message.lower()
+        assert "раньше начала" in e.message
 
 
 def test_edit_start_of_running_forbidden(conn):
@@ -212,7 +217,7 @@ def test_edit_start_of_running_forbidden(conn):
         update_entry(conn, entry["id"], start=_iso(new_start))
         assert False, "expected AppError"
     except AppError as e:
-        assert "running" in e.message.lower() or "forbidden" in e.message.lower()
+        assert "идущего" in e.message
 
 
 def test_stop_with_no_active(conn):
@@ -221,7 +226,7 @@ def test_stop_with_no_active(conn):
         stop_timer(conn, emp["id"])
         assert False, "expected AppError"
     except AppError as e:
-        assert "no active" in e.message.lower()
+        assert "нет запущенного" in e.message
 
 
 def test_empty_name_rejected(client):
@@ -285,3 +290,48 @@ def test_hard_delete_removes_entries(conn):
     )
     assert result["entries"] == []
     assert conn.execute("SELECT COUNT(*) AS c FROM employees WHERE id = ?", (emp["id"],)).fetchone()["c"] == 0
+
+
+def test_empty_description_is_russian_not_raw_json(client):
+    eid = client.post("/api/employees", json={"name": "Lena"}).json()["id"]
+    r = client.post("/api/timers/start", json={"employee_id": eid, "description": ""})
+    assert r.status_code == 400
+    assert r.json() == {"detail": "Введите описание задачи"}
+
+
+def test_validation_errors_are_russian_strings(client):
+    r = client.post("/api/timers/start", json={"description": "x"})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert isinstance(detail, str)
+    assert "Сотрудник" in detail
+    r = client.post("/api/timers/start", json={"employee_id": "abc", "description": "x"})
+    assert isinstance(r.json()["detail"], str)
+    assert "числом" in r.json()["detail"]
+    r = client.get("/api/nope")
+    assert r.json()["detail"] == "Не найдено"
+
+
+def test_board_pagination_and_active_timer(client, conn):
+    ids = [client.post("/api/employees", json={"name": f"E{i}"}).json()["id"] for i in range(25)]
+    start_timer(conn, ids[0], "Work")
+    b = client.get("/api/employees/board?page=1&per_page=10").json()
+    assert b["total"] == 25 and b["pages"] == 3 and len(b["items"]) == 10
+    assert b["items"][0]["active_timer"]["description"] == "Work"
+    assert b["items"][1]["active_timer"] is None
+    b3 = client.get("/api/employees/board?page=3&per_page=10").json()
+    assert len(b3["items"]) == 5
+    assert len(client.get("/api/employees/board?per_page=50").json()["items"]) == 25
+    r = client.get("/api/employees/board?per_page=7")
+    assert r.status_code == 400
+    assert "10, 20 или 50" in r.json()["detail"]
+
+
+def test_move_employee_reorders(client):
+    ids = [client.post("/api/employees", json={"name": n}).json()["id"] for n in "ABCD"]
+    r = client.post(f"/api/employees/{ids[3]}/move", json={"to_index": 0})
+    assert r.status_code == 200
+    assert [e["name"] for e in r.json()] == ["D", "A", "B", "C"]
+    client.post(f"/api/employees/{ids[3]}/move", json={"to_index": 99})
+    names = [e["name"] for e in client.get("/api/employees").json()]
+    assert names == ["A", "B", "C", "D"]

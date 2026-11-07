@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     title TEXT,
-    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1))
+    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    position INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS time_entries (
@@ -56,6 +57,11 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection, seed: bool = True) -> None:
     conn.executescript(_SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(employees)").fetchall()}
+    if "position" not in cols:
+        # Migration for databases created before manual ordering existed.
+        conn.execute("ALTER TABLE employees ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE employees SET position = id")
     if seed:
         row = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()
         if row["c"] == 0:
@@ -63,6 +69,7 @@ def init_db(conn: sqlite3.Connection, seed: bool = True) -> None:
                 "INSERT INTO employees (name, title) VALUES (?, ?)",
                 _SEED,
             )
+            conn.execute("UPDATE employees SET position = id")
     conn.commit()
 
 

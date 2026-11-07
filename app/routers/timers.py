@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import sqlite3
 
 from app.deps import get_db
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["timers"])
 
 class StartBody(BaseModel):
     employee_id: int
-    description: str = Field(..., min_length=1, max_length=500)
+    description: str = ""
 
 
 class StopBody(BaseModel):
@@ -29,7 +29,7 @@ class StopBody(BaseModel):
 
 
 class EditBody(BaseModel):
-    description: Optional[str] = Field(None, max_length=500)
+    description: Optional[str] = None
     start: Optional[str] = None
     end: Optional[str] = None
 
@@ -67,7 +67,7 @@ def api_get_entry(entry_id: int, conn: sqlite3.Connection = Depends(get_db)):
     try:
         entry = get_entry(conn, entry_id)
         if entry is None:
-            raise HTTPException(status_code=404, detail="Time entry not found")
+            raise HTTPException(status_code=404, detail="Запись не найдена")
         return entry
     finally:
         conn.close()

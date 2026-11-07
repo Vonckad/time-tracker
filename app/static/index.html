@@ -14,53 +14,52 @@
   </header>
 
   <main>
-    <div class="grid-2">
-      <section class="card">
-        <h2>Сотрудники</h2>
-        <div class="row">
-          <div>
-            <label for="emp-name">Имя</label>
-            <input id="emp-name" placeholder="Имя сотрудника" />
-          </div>
-          <div>
-            <label for="emp-title">Должность (необяз.)</label>
-            <input id="emp-title" placeholder="Должность" />
-          </div>
+    <section class="card">
+      <div class="card-head">
+        <h2>Сотрудники и таймеры</h2>
+        <button id="btn-edit-mode" type="button" class="secondary">Редактировать</button>
+      </div>
+      <div class="row add-row">
+        <div>
+          <label for="emp-name">Имя</label>
+          <input id="emp-name" placeholder="Имя сотрудника" maxlength="200" />
         </div>
-        <button id="btn-add-emp" type="button">Добавить</button>
-        <p id="emp-msg" class="msg"></p>
-        <div style="overflow-x:auto; margin-top:0.75rem">
-          <table>
-            <thead>
-              <tr><th>Имя</th><th>Должность</th><th></th></tr>
-            </thead>
-            <tbody id="emp-table"></tbody>
-          </table>
+        <div>
+          <label for="emp-title">Должность (необяз.)</label>
+          <input id="emp-title" placeholder="Должность" maxlength="200" />
         </div>
-      </section>
-
-      <section class="card">
-        <h2>Таймер</h2>
-        <label for="timer-emp">Сотрудник</label>
-        <select id="timer-emp"></select>
-        <label for="timer-desc">Задача (до 500 символов)</label>
-        <textarea id="timer-desc" maxlength="500" placeholder="Что делаем?"></textarea>
-        <div class="row">
-          <button id="btn-start" type="button">Старт</button>
-          <button id="btn-stop" type="button" class="secondary">Стоп</button>
+        <div style="flex:0">
+          <label>&nbsp;</label>
+          <button id="btn-add-emp" type="button" disabled>Добавить</button>
         </div>
-        <p id="timer-msg" class="msg"></p>
-        <h2 style="margin-top:1rem">Активные</h2>
-        <div style="overflow-x:auto">
-          <table>
-            <thead>
-              <tr><th>Сотрудник</th><th>Задача</th><th>Старт</th></tr>
-            </thead>
-            <tbody id="active-table"></tbody>
-          </table>
+      </div>
+      <p id="emp-msg" class="msg"></p>
+      <p id="edit-hint" class="hint" hidden>Режим редактирования: перетаскивайте строки за ⠿ или двигайте стрелками, таймеры скрыты. При удалении сотрудника его таймер останавливается.</p>
+      <div style="overflow-x:auto">
+        <table class="board">
+          <thead>
+            <tr><th class="col-handle"></th><th>Сотрудник</th><th>Задача</th><th>Время</th><th></th></tr>
+          </thead>
+          <tbody id="emp-table"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <div class="pager-size">
+          <label for="per-page">На странице</label>
+          <select id="per-page">
+            <option value="10">10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+          </select>
         </div>
-      </section>
-    </div>
+        <div class="pager-nav">
+          <button id="pg-prev" type="button" class="secondary">‹</button>
+          <span id="pg-pages"></span>
+          <button id="pg-next" type="button" class="secondary">›</button>
+        </div>
+        <span id="pg-info" class="hint"></span>
+      </div>
+    </section>
 
     <section class="card">
       <h2>Отчёт за период</h2>
@@ -112,6 +111,21 @@
       <div class="row">
         <button id="btn-edit-save" type="button">Сохранить</button>
         <button id="btn-edit-cancel" type="button" class="secondary">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="start-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h3>Запустить таймер</h3>
+      <p id="start-who" style="color:var(--muted);font-size:0.9rem"></p>
+      <input type="hidden" id="start-id" />
+      <label for="start-desc">Описание задачи (до 500 символов)</label>
+      <textarea id="start-desc" maxlength="500" placeholder="Что делаем?"></textarea>
+      <p id="start-msg" class="msg"></p>
+      <div class="row">
+        <button id="btn-start-go" type="button" disabled>Старт</button>
+        <button id="btn-start-cancel" type="button" class="secondary">Отмена</button>
       </div>
     </div>
   </div>
