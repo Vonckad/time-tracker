@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 import sqlite3
@@ -12,7 +14,7 @@ router = APIRouter(prefix="/api/employees", tags=["employees"])
 
 class EmployeeCreate(BaseModel):
     name: str = Field(..., min_length=1)
-    title: str | None = None
+    title: Optional[str] = None
 
 
 @router.get("")

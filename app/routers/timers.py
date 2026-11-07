@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 import sqlite3
@@ -27,9 +29,9 @@ class StopBody(BaseModel):
 
 
 class EditBody(BaseModel):
-    description: str | None = Field(None, max_length=500)
-    start: str | None = None
-    end: str | None = None
+    description: Optional[str] = Field(None, max_length=500)
+    start: Optional[str] = None
+    end: Optional[str] = None
 
 
 @router.get("/timers/active")
