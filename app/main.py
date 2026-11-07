@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -15,16 +16,18 @@ from app.services import AppError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="Time Tracker", version="1.0.0")
 
-
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     conn = get_db()
     try:
         init_db(conn, seed=True)
     finally:
         conn.close()
+    yield
+
+
+app = FastAPI(title="Time Tracker", version="1.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(AppError)
